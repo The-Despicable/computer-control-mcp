@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+*.log
+*.tar.gz
+*Zone.Identifier
+screenshots/
+.DS_Store

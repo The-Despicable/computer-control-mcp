@@ -1,0 +1,28 @@
+{
+  "name": "computer-control-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Windows-first computer-control MCP server (observe/act/wait with safety bindings)",
+  "engines": { "node": ">=18.19" },
+  "bin": { "computer-control-mcp": "dist/src/index.js" },
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/src/index.js",
+    "test": "npm run build && node --test dist/tests/unit/",
+    "gate:b": "npm run build && node tests/scripts/gate-b-observe.mjs",
+    "gate:c": "npm run build && node tests/scripts/gate-c-negative.mjs",
+    "gate:d": "npm run build && node tests/scripts/gate-d-notepad.mjs",
+    "gate:e": "npm run build && node tests/scripts/gate-e-devloop.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^20.14.0"
+  },
+  "files": ["dist", "src/windows-backend/scripts", "README.md"]
+}

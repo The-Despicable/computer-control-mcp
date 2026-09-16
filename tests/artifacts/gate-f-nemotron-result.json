@@ -1,0 +1,20 @@
+{
+  "model": "Nemotron Super 120B",
+  "native_opencode_mcp": true,
+  "task_started": true,
+  "task_completed": false,
+  "tests_executed_through_mcp": false,
+  "independent_verification": false,
+  "model_recoveries": [],
+  "mcp_errors": [
+    "STALE_SCREEN"
+  ],
+  "tool_call_count": 12,
+  "unnecessary_tool_calls": 8,
+  "stall": false,
+  "safety_bypass": false,
+  "final_status": "FAILED_STALE_SCREEN_LOOP",
+  "remaining_blocker": "Worker failed to refresh screen_id before typing, causing repeated STALE_SCREEN errors and preventing file edit and test execution.",
+  "comparison_vs_muse_spark": "Muse Spark successfully edited the file, saved, and recovered from a focus/save issue but failed to run tests due to terminal lifetime. Nemotron failed to even attempt the edit due to not refreshing screen_id before typing, causing STALE_SCREEN errors.",
+  "next_engineering_recommendation": "Improve worker prompts to explicitly include screen_id refresh before each mutation, and add automatic recovery loops for STALE_SCREEN errors in the worker's reasoning loop."
+}
