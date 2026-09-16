@@ -1,4 +1,4 @@
-. "$PSScriptRoot\_io.ps1"; . "$PSScriptRoot\_win32.ps1"; . "$PSScriptRoot\_state.ps1"
+. "$PSScriptRoot\_bootstrap.ps1"
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 function Test-OcrAvailable {
   try {
@@ -13,7 +13,9 @@ function Test-OcrAvailable {
 try {
   [void][W]::SetProcessDPIAware()
   $req = Read-McpRequest
+  $tState = [System.Diagnostics.Stopwatch]::StartNew()
   $state = Get-UiState
+  $stateMs = $tState.ElapsedMilliseconds
   Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
   $mode = [string]$req.mode
   $limit = 10; if ($req.limit) { $limit = [int]$req.limit }
@@ -127,5 +129,6 @@ try {
     ocr_available = $ocrAvailable; ocr_max_dimension = $ocrMax; truncated = $truncated
     visited = $visited; elapsed_ms = $sw.ElapsedMilliseconds
     monitors = $state.monitors; virtual_screen = $state.virtual_screen
-    foreground = $state.foreground; cursor = $state.cursor; timestamp = $state.timestamp } }
+    foreground = $state.foreground; cursor = $state.cursor; timestamp = $state.timestamp
+    timing = @{ state_ms = $stateMs; uia_ms = $sw.ElapsedMilliseconds } } }
 } catch { if ($null -eq $global:CC_RESULT) { Fail "BACKEND_ERROR" $_.Exception.Message } else { throw } }

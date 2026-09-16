@@ -9,6 +9,7 @@ const FAKE = fileURLToPath(new URL("./fake-worker.js", import.meta.url));
 function makePool(size = 1, timeout = 3000): PsPool {
   return new PsPool({ exe: process.execPath, args: [FAKE], size, requestTimeoutMs: timeout });
 }
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 test("worker startup + a request round-trips", async () => {
   const pool = makePool(1);
@@ -93,4 +94,33 @@ test("shutdown: no requests after close", async () => {
     assert.match(toToolError(e).message, /closed/i);
     return true;
   });
+});
+
+test("contention proof: within one lane, a short op queues behind a slow op", async () => {
+  const pool = new PsPool({ exe: process.execPath, args: [FAKE], controlSize: 1, perceptionSize: 1, requestTimeoutMs: 4000 });
+  try {
+    await pool.run("echo", {}); // warm
+    const slow = pool.run("delay", { ms: 500 }, 4000, "perception");
+    await sleep(30);
+    const t0 = Date.now();
+    await pool.run("echo", {}, 4000, "perception");
+    const waited = Date.now() - t0;
+    await slow;
+    assert.ok(waited >= 200, `expected the short op to queue behind the slow one, waited ${waited}ms`);
+  } finally { await pool.close(); }
+});
+
+test("lane isolation: a slow perception op does NOT starve a control op", async () => {
+  const pool = new PsPool({ exe: process.execPath, args: [FAKE], controlSize: 1, perceptionSize: 1, requestTimeoutMs: 4000 });
+  try {
+    await pool.run("echo", {}, 4000, "control"); // warm the control worker
+    const slow = pool.run("delay", { ms: 600 }, 4000, "perception");
+    await sleep(50);
+    const t0 = Date.now();
+    const r = await pool.run<{ payload: { lane: string } }>("echo", { lane: "control" }, 4000, "control");
+    const controlMs = Date.now() - t0;
+    await slow;
+    assert.equal(r.payload.lane, "control");
+    assert.ok(controlMs < 250, `control op waited ${controlMs}ms behind perception`);
+  } finally { await pool.close(); }
 });

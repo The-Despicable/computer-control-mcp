@@ -51,6 +51,19 @@ export interface WindowsResult extends CurrentUiState {
   windows: WindowEntry[];
 }
 
+/** Bounded UIA text read. `expected_hwnd`/`expected_pid` (optional) pin the target. */
+export interface ReadTextRequest { expected_hwnd?: number; expected_pid?: number; max_chars: number; }
+export interface ReadTextResult {
+  text: string;
+  complete: boolean;
+  source: "text" | "value" | "none";
+  control_type?: string | null;
+  chars?: number;
+  /** Identity evidence around the read (owner PID before/after, window validity). */
+  identity?: { hwnd: number; start_pid: number; end_pid: number; window_valid: boolean };
+  target?: { hwnd: number; pid: number; process: string; title: string } | null;
+}
+
 export interface PerceiveRequest {
   mode: "text" | "element" | "summary";
   text?: string; regex?: string; name?: string; control_type?: string;
@@ -68,13 +81,16 @@ export type InputAction =
 export interface InputExpectation {
   foreground_hwnd: number; virtual_screen: Rect; monitors_hash: string;
 }
-
 export type InputRequest = InputAction & { expect: InputExpectation };
 
 export interface Backend {
   capture(req: CaptureRequest): Promise<CaptureResult>;
   state(): Promise<CurrentUiState>;
   windows(): Promise<WindowsResult>;
+  /** Single-window lookup (win32_ms) — replaces full enumeration for window_focus. */
+  windowInfo(hwnd: number): Promise<WindowEntry>;
+  /** Bounded structured text read (UIA TextPattern/ValuePattern). */
+  readText(req: ReadTextRequest): Promise<ReadTextResult>;
   focus(hwnd: number): Promise<CurrentUiState>;
   perceive(req: PerceiveRequest): Promise<PerceiveOutcome>;
   input(req: InputRequest): Promise<InputResult>;

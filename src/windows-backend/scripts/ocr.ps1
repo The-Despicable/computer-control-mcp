@@ -2,7 +2,7 @@
 # coordinates. Tiling, coordinate reconstruction and truncation semantics live
 # in TypeScript (src/core/ocr.ts) so they are unit-testable without an OCR
 # engine. This script is the thin OCR primitive only.
-. "$PSScriptRoot\_io.ps1"; . "$PSScriptRoot\_win32.ps1"; . "$PSScriptRoot\_state.ps1"
+. "$PSScriptRoot\_bootstrap.ps1"
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 # Force WinRT type projection before any New-Object (PowerShell 5.1 needs the
 # explicit assembly + ContentType hint the first time).
@@ -59,14 +59,17 @@ try {
   $engine = $null
   try { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() } catch { $engine = $null }
   if ($null -eq $engine) {
-    Write-McpResult @{ ok = $true; data = @{ lines = @(); ocr_available = $false } }
+    Write-McpResult @{ ok = $true; data = @{ lines = @(); ocr_available = $false; timing = @{ capture_ms = 0; ocr_ms = 0 } } }
   } else {
     $re = $null
     if ($req.regex) {
       try { $re = New-BoundedRegex ([string]$req.regex) ([int]$req.regex_timeout_ms) }
       catch { Fail "INVALID_ARGUMENT" $_.Exception.Message }
     }
+    $tCap = [System.Diagnostics.Stopwatch]::StartNew()
     $png = Get-RegionPng $x $y $w $h
+    $capMs = $tCap.ElapsedMilliseconds
+    $tOcr = [System.Diagnostics.Stopwatch]::StartNew()
     $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
     $writer = New-Object Windows.Storage.Streams.DataWriter($stream.GetOutputStreamAt(0))
     $writer.WriteBytes($png)
@@ -79,6 +82,7 @@ try {
       $soft = [Windows.Graphics.Imaging.SoftwareBitmap]::Convert($soft, [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8)
     }
     $res = Wait-WinrtOp ($engine.RecognizeAsync($soft)) ([Windows.Media.Ocr.OcrResult])
+    $ocrMs = $tOcr.ElapsedMilliseconds
     $lines = @()
     foreach ($line in $res.Lines) {
       $text = [string]$line.Text
@@ -95,6 +99,6 @@ try {
                   w = [int][Math]::Ceiling($x1 - $x0); h = [int][Math]::Ceiling($y1 - $y0) }
       }
     }
-    Write-McpResult @{ ok = $true; data = @{ lines = $lines; ocr_available = $true } }
+    Write-McpResult @{ ok = $true; data = @{ lines = $lines; ocr_available = $true; timing = @{ capture_ms = $capMs; ocr_ms = $ocrMs } } }
   }
 } catch { if ($null -eq $global:CC_RESULT) { Fail "BACKEND_ERROR" $_.Exception.Message } else { throw } }

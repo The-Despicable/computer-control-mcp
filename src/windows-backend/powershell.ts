@@ -3,19 +3,23 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ToolError, normalizePsCode, toToolError } from "../core/errors.js";
-import { log } from "../core/util.js";
+import { log, logTiming } from "../core/util.js";
 import { collectOcrMatches, type OcrLine } from "../core/ocr.js";
 import { probeCapabilities, type CapabilityReport } from "../core/capability.js";
-import { PsPool } from "./worker.js";
-import type { Backend, CaptureRequest, CaptureResult, CurrentUiState, InputRequest, InputResult, PerceiveOutcome, PerceiveRequest, WindowsResult } from "../deps.js";
+import { PsPool, type PsLaneName } from "./worker.js";
+import type { Backend, CaptureRequest, CaptureResult, CurrentUiState, InputRequest, InputResult, PerceiveOutcome, PerceiveRequest, ReadTextRequest, ReadTextResult, WindowEntry, WindowsResult } from "../deps.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url)); // UNC-safe (\\wsl.localhost, \\server\share)
 const ASSETS = join(__dirname, "scripts");
 const PS_EXE = process.env.COMPUTER_CONTROL_POWERSHELL || "powershell.exe";
 const MARKER = "###MCP###";
 
-export const HELPERS = ["_io.ps1", "_win32.ps1", "_state.ps1", "state.ps1", "windows.ps1",
-  "capture.ps1", "focus.ps1", "perception.ps1", "input.ps1", "ocr.ps1", "worker.ps1"];
+export const HELPERS = ["_io.ps1", "_bootstrap.ps1", "_win32.ps1", "_state.ps1", "state.ps1", "windows.ps1", "window_info.ps1",
+  "capture.ps1", "focus.ps1", "perception.ps1", "input.ps1", "ocr.ps1", "read_text.ps1", "worker.ps1"];
+
+// Cheap control scripts share a reserved lane so they cannot queue behind a slow
+// UIA traversal or OCR. Everything else (capture/perception/ocr) is perception.
+const CONTROL_SCRIPTS = new Set(["windows.ps1", "window_info.ps1", "focus.ps1", "state.ps1", "input.ps1"]);
 
 interface PsEnvelopeOk<T> { ok: true; data: T }
 
@@ -122,7 +126,8 @@ export class PowershellBackend implements Backend {
       this.pool = new PsPool({
         exe: PS_EXE,
         args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(ASSETS, "worker.ps1")],
-        size: Math.max(1, Number(process.env.COMPUTER_CONTROL_PS_POOL ?? 2)),
+        controlSize: Math.max(1, Number(process.env.COMPUTER_CONTROL_PS_CONTROL_POOL ?? 1)),
+        perceptionSize: Math.max(1, Number(process.env.COMPUTER_CONTROL_PS_PERCEPTION_POOL ?? process.env.COMPUTER_CONTROL_PS_POOL ?? 2)),
         env: process.env,
         requestTimeoutMs: 45000,
         onStderr: (d) => { if (process.env.COMPUTER_CONTROL_LOG === "debug") log("debug", `[ps-worker] ${d.trimEnd()}`); },
@@ -164,14 +169,25 @@ export class PowershellBackend implements Backend {
 
   capabilities(): CapabilityReport | undefined { return this.capabilityReport; }
 
+  private laneFor(script: string): PsLaneName { return CONTROL_SCRIPTS.has(script) ? "control" : "perception"; }
+
+  private logStages(script: string, lane: PsLaneName, result: unknown): void {
+    if (!result || typeof result !== "object") return;
+    const timing = (result as { timing?: unknown }).timing;
+    if (timing && typeof timing === "object") logTiming("ps_stage", { script, lane, ...(timing as Record<string, unknown>) });
+  }
+
   private async send<T>(script: string, payload: unknown, timeoutMs: number): Promise<T> {
+    const lane = this.laneFor(script);
     if (this.pool && !this.preferSpawn) {
       try {
-        return await this.pool.run<T>(script, payload, timeoutMs);
+        const r = await this.pool.run<T>(script, payload, timeoutMs, lane);
+        this.logStages(script, lane, r);
+        return r;
       } catch (e) {
         const te = toToolError(e);
         const workerDown = te.dispatch === "pre" &&
-          /worker (is not running|exited|spawn error)|no PowerShell workers|pool is closed/i.test(te.message);
+          /worker (is not running|exited|spawn error)|no PowerShell workers|lane is closed|pool is closed/i.test(te.message);
         if (this.mode === "worker") throw e;
         if (workerDown) {
           this.preferSpawn = true;
@@ -181,7 +197,9 @@ export class PowershellBackend implements Backend {
         }
       }
     }
-    return psRun<T>(script, payload, timeoutMs);
+    const r = await psRun<T>(script, payload, timeoutMs);
+    this.logStages(script, lane, r);
+    return r;
   }
 
   private async ocrTile(tile: { x: number; y: number; w: number; h: number }, regex?: string): Promise<OcrLine[]> {
@@ -195,6 +213,8 @@ export class PowershellBackend implements Backend {
   capture(req: CaptureRequest): Promise<CaptureResult> { return this.send<CaptureResult>("capture.ps1", req, 30000); }
   state(): Promise<CurrentUiState> { return this.send<CurrentUiState>("state.ps1", {}, 15000); }
   windows(): Promise<WindowsResult> { return this.send<WindowsResult>("windows.ps1", {}, 20000); }
+  windowInfo(hwnd: number): Promise<WindowEntry> { return this.send<WindowEntry>("window_info.ps1", { hwnd }, 15000); }
+  readText(req: ReadTextRequest): Promise<ReadTextResult> { return this.send<ReadTextResult>("read_text.ps1", req, 20000); }
   focus(hwnd: number): Promise<CurrentUiState> { return this.send<CurrentUiState>("focus.ps1", { hwnd }, 15000); }
   input(req: InputRequest): Promise<InputResult> { return this.send<InputResult>("input.ps1", req, 20000); }
 

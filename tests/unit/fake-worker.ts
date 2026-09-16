@@ -20,6 +20,11 @@ rl.on("line", (line: string) => {
   const s = req.script ?? "";
   if (s === "hang") return; // never answer -> caller timeout
   if (s === "crash") process.exit(7);
+  if (s === "delay") {
+    const ms = Number((req.payload as { ms?: number } | undefined)?.ms ?? 100);
+    setTimeout(() => send({ id: req.id, ok: true, data: { delayed_ms: ms } }), ms);
+    return;
+  }
   if (s === "garbage") { process.stdout.write("###RES###@@not-json@@\n"); return; }
   if (s === "fail") { send({ id: req.id, ok: false, error: { code: "INVALID_ARGUMENT", message: "nope" } }); return; }
   send({ id: req.id, ok: true, data: { script: s, payload: req.payload } });

@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { ToolError, normalizePsCode } from "../core/errors.js";
-import { log } from "../core/util.js";
+import { log, logTiming } from "../core/util.js";
 
 /**
  * Persistent PowerShell execution layer.
@@ -13,10 +13,16 @@ import { log } from "../core/util.js";
  *   request : ###REQ###<base64(JSON { id, script, payload })>\n
  *   response: ###RES###<base64(JSON { id, ok, data } | { id, ok:false, error })>\n
  *
+ * Lanes: cheap control scripts (window discovery/info/focus/state/input) and
+ * heavier perception scripts (capture/perception/ocr) run on separate worker
+ * pools, so a slow UIA traversal or OCR cannot starve a window switch or a
+ * mutation. Mutations are still serialized by the Node mutation lock; lanes only
+ * isolate resource contention.
+ *
  * The Node side owns request ids, response correlation, timeouts, crash
- * detection, restart and (crucially) dispatch-phase tagging used by mutation
- * receipts: any failure after a request has been written is potentially
- * post-dispatch and therefore UNCERTAIN.
+ * detection, restart and dispatch-phase tagging used by mutation receipts: any
+ * failure after a request has been written is potentially post-dispatch and
+ * therefore UNCERTAIN.
  */
 
 export const REQ_MARK = "###REQ###";
@@ -145,7 +151,7 @@ export class PsWorker {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        // Mark dead FIRST so the pool cannot hand this worker to another caller
+        // Mark dead FIRST so the lane cannot hand this worker to another caller
         // before its 'exit' event arrives, then kill it so it cannot answer late.
         this.alive = false;
         this.kill();
@@ -177,7 +183,8 @@ export class PsWorker {
   }
 }
 
-export interface PsPoolOptions {
+export interface PsLaneOptions {
+  name: string;
   exe: string;
   args: string[];
   size?: number;
@@ -191,11 +198,11 @@ export interface PsPoolOptions {
 interface Waiter { resolve: (w: PsWorker) => void; reject: (e: Error) => void; }
 
 /**
- * A small pool of persistent workers. Reads may run concurrently across
- * workers; mutations are already serialized by the Node mutation lock.
- * A dead worker is replaced automatically (unless the pool is closing).
+ * A bounded pool of persistent workers for one lane. A dead worker is replaced
+ * automatically (unless the lane is closing); a burst of restarts is capped so a
+ * missing PowerShell cannot loop forever.
  */
-export class PsPool {
+export class PsLane {
   private workers: PsWorker[] = [];
   private waiters: Waiter[] = [];
   private closing = false;
@@ -203,8 +210,8 @@ export class PsPool {
   private lastRestartAt = 0;
   private static readonly MAX_BURST_RESTARTS = 5;
 
-  constructor(private readonly opts: PsPoolOptions) {
-    const size = Math.max(1, opts.size ?? 2);
+  constructor(private readonly opts: PsLaneOptions) {
+    const size = Math.max(1, opts.size ?? 1);
     for (let i = 0; i < size; i++) this.spawnOne();
   }
 
@@ -227,16 +234,14 @@ export class PsPool {
   private onWorkerExit(dead: PsWorker): void {
     this.workers = this.workers.filter(w => w !== dead);
     if (this.closing) {
-      // no replacement; wake waiters so callers fail fast
       this.flushWaiters();
       return;
     }
-    // Guard against a spawn/exit loop (e.g. PowerShell genuinely unavailable).
     const now = Date.now();
     if (now - this.lastRestartAt < 500) this.restarts += 1; else this.restarts = 0;
     this.lastRestartAt = now;
-    if (this.restarts > PsPool.MAX_BURST_RESTARTS) {
-      log("error", "[ps-pool] too many worker restarts in a burst; not respawning (caller may fall back)", { restarts: this.restarts });
+    if (this.restarts > PsLane.MAX_BURST_RESTARTS) {
+      log("error", `[ps-pool] too many ${this.opts.name} worker restarts in a burst; not respawning`, { restarts: this.restarts });
       this.flushWaiters();
       return;
     }
@@ -247,19 +252,12 @@ export class PsPool {
 
   private flushWaiters(): void {
     const waiters = this.waiters.splice(0);
-    for (const w of waiters) w.reject(new ToolError("BACKEND_ERROR", "PowerShell pool is closed"));
+    for (const w of waiters) w.reject(new ToolError("BACKEND_ERROR", `PowerShell ${this.opts.name} lane is closed`));
   }
 
   private acquire(): Promise<PsWorker> {
-    if (this.closing) return Promise.reject(new ToolError("BACKEND_ERROR", "PowerShell pool is closed"));
+    if (this.closing) return Promise.reject(new ToolError("BACKEND_ERROR", `PowerShell ${this.opts.name} lane is closed`));
     const healthy = this.workers.filter(w => w.healthy);
-    if (healthy.length === 0) {
-      if (this.workers.length > 0) {
-        // all workers are unhealthy but replacements are coming; wait
-      } else {
-        return Promise.reject(new ToolError("BACKEND_ERROR", "no PowerShell workers available"));
-      }
-    }
     if (healthy.length > 0) {
       healthy.sort((a, b) => a.pendingCount - b.pendingCount);
       const idle = healthy.find(w => w.pendingCount === 0);
@@ -269,10 +267,14 @@ export class PsPool {
   }
 
   async run<T>(script: string, payload: unknown, timeoutMs?: number): Promise<T> {
+    const t0 = Date.now();
     const w = await this.acquire();
+    const queueWaitMs = Date.now() - t0;
+    const t1 = Date.now();
     try {
       return await w.run<T>(script, payload, timeoutMs);
     } finally {
+      logTiming("ps_run", { lane: this.opts.name, script, queue_wait_ms: queueWaitMs, run_ms: Date.now() - t1, total_ms: Date.now() - t0 });
       const waiter = this.waiters.shift();
       if (waiter) {
         const usable = this.workers.find(x => x.healthy && x.pendingCount === 0);
@@ -282,10 +284,64 @@ export class PsPool {
     }
   }
 
+  get pendingTotal(): number { return this.workers.reduce((s, w) => s + w.pendingCount, 0); }
+  get workerCount(): number { return this.workers.length; }
+
   async close(): Promise<void> {
     this.closing = true;
     this.flushWaiters();
     const workers = this.workers.splice(0);
     for (const w of workers) w.kill();
+  }
+}
+
+export type PsLaneName = "control" | "perception";
+
+export interface PsPoolOptions {
+  exe: string;
+  args: string[];
+  /** Short/control lane size (window discovery/info/focus/state/input). */
+  controlSize?: number;
+  /** Perception lane size (capture/perception/ocr). */
+  perceptionSize?: number;
+  /** Legacy alias: sets the perception lane size (control lane stays 1). */
+  size?: number;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  requestTimeoutMs?: number;
+  spawnImpl?: SpawnImpl;
+  onStderr?: (chunk: string) => void;
+}
+
+/**
+ * Two-lane facade. Control work never queues behind a slow perception op.
+ */
+export class PsPool {
+  private readonly lanes: Record<PsLaneName, PsLane>;
+
+  constructor(opts: PsPoolOptions) {
+    const common = {
+      exe: opts.exe, args: opts.args, cwd: opts.cwd, env: opts.env,
+      requestTimeoutMs: opts.requestTimeoutMs, spawnImpl: opts.spawnImpl, onStderr: opts.onStderr,
+    };
+    this.lanes = {
+      control: new PsLane({ ...common, name: "control", size: Math.max(1, opts.controlSize ?? 1) }),
+      perception: new PsLane({ ...common, name: "perception", size: Math.max(1, opts.perceptionSize ?? opts.size ?? 2) }),
+    };
+  }
+
+  run<T>(script: string, payload: unknown, timeoutMs?: number, lane: PsLaneName = "perception"): Promise<T> {
+    return this.lanes[lane].run<T>(script, payload, timeoutMs);
+  }
+
+  stats(): Record<PsLaneName, { workers: number; pending: number }> {
+    return {
+      control: { workers: this.lanes.control.workerCount, pending: this.lanes.control.pendingTotal },
+      perception: { workers: this.lanes.perception.workerCount, pending: this.lanes.perception.pendingTotal },
+    };
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([this.lanes.control.close(), this.lanes.perception.close()]);
   }
 }

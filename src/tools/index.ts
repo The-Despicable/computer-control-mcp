@@ -5,6 +5,7 @@ import { observe, windowList, windowFocus } from "./observation.js";
 import { findText, findElement } from "./perception.js";
 import { click, type as typeTool, keyPress, scroll, drag } from "./input.js";
 import { wait, waitForText, waitForChange } from "./wait.js";
+import { readText } from "./read.js";
 
 export interface ToolDef {
   name: string; title: string; description: string;
@@ -15,6 +16,6 @@ export interface ToolDef {
 
 export const TOOLS: ToolDef[] = [
   observe, windowList, windowFocus, findText, findElement,
-  click, typeTool, keyPress, scroll, drag,
+  click, typeTool, keyPress, scroll, drag, readText,
   wait, waitForText, waitForChange,
 ];

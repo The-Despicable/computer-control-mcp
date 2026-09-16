@@ -1,4 +1,4 @@
-if (-not ("W" -as [type])) {
+if (-not $global:CC_WINTYPE_LOADED) {
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -28,6 +28,7 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
@@ -40,6 +41,13 @@ public static class W {
   [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr h, int type, out uint x, out uint y);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
   [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+  // Fast, allocation-free process name lookup. Replaces the Get-Process cmdlet
+  // (the dominant per-call cost). The PID is always the window's real owner PID
+  // provided by GetWindowThreadProcessId; this helper never reads the
+  // PowerShell host PID.
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder sb, ref uint size);
 
   static int IS = Marshal.SizeOf(typeof(INPUT));
 
@@ -101,6 +109,27 @@ public static class W {
     return h.ToInt64() + "," + pid + "," + f.Left + "," + f.Top + "," + (f.Right - f.Left) + "," + (f.Bottom - f.Top) + "," + (IsIconic(h) ? 1 : 0) + "," + sb.ToString();
   }
   public static string ForegroundInfo() { return WindowInfo(GetForegroundWindow()); }
+
+  // Process image name (without .exe) for a PID, via QueryFullProcessImageName.
+  // Same value Get-Process -Id <pid> would report for the SAME pid, derived
+  // solely from the supplied pid (never the PowerShell host). Returns "" when
+  // the process cannot be queried (dead/elevated) — exactly as the previous
+  // try/catch around Get-Process did.
+  public static string ProcessName(uint pid) {
+    if (pid == 0) return "";
+    IntPtr h = OpenProcess(0x1000u /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+    if (h == IntPtr.Zero) return "";
+    try {
+      var sb = new StringBuilder(1024);
+      uint size = 1024;
+      if (!QueryFullProcessImageName(h, 0, sb, ref size)) return "";
+      string path = sb.ToString();
+      int i = path.LastIndexOf('\\');
+      string name = i >= 0 ? path.Substring(i + 1) : path;
+      if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4);
+      return name;
+    } catch { return ""; } finally { CloseHandle(h); }
+  }
 
   public static string[] GetWindows() {
     var list = new List<string>();
@@ -241,4 +270,5 @@ public static class W {
   public static string GetCursor() { POINT p; GetCursorPos(out p); return p.X + "," + p.Y; }
 }
 "@
+$global:CC_WINTYPE_LOADED = $true
 }

@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { TOOLS } from "./tools/index.js";
 import { errorResult } from "./core/result.js";
 import { toToolError } from "./core/errors.js";
-import { withMutationLock } from "./core/util.js";
+import { withMutationLock, logTiming } from "./core/util.js";
 import type { Ctx } from "./deps.js";
 
 export function createServer(ctx: Ctx): McpServer {
@@ -17,8 +17,16 @@ export function createServer(ctx: Ctx): McpServer {
       // Mutations serialize on the mutation lock; reads and waits run concurrently
       // so a 60s wait_for_text never starves observe.
       const run = () => tool.handler(ctx, args);
-      try { return tool.readOnly === true ? await run() : await withMutationLock(run); }
-      catch (e: unknown) { return errorResult(toToolError(e)); }
+      const t0 = Date.now();
+      try {
+        const r = tool.readOnly === true ? await run() : await withMutationLock(run);
+        logTiming("tool", { tool: tool.name, ok: true, total_ms: Date.now() - t0 });
+        return r;
+      } catch (e: unknown) {
+        const te = toToolError(e);
+        logTiming("tool", { tool: tool.name, ok: false, error: te.code, total_ms: Date.now() - t0 });
+        return errorResult(te);
+      }
     });
   }
   return server;

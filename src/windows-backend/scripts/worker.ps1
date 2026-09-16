@@ -42,6 +42,7 @@ while ($true) {
 
     $global:CC_REQ = $req.payload
     $global:CC_RESULT = $null
+    $tExec = [System.Diagnostics.Stopwatch]::StartNew()
     try {
       . $scriptPath
     } catch {
@@ -51,8 +52,14 @@ while ($true) {
         continue
       }
     }
+    $execMs = $tExec.ElapsedMilliseconds
     if ($null -eq $global:CC_RESULT) { Write-WorkerError $id "BACKEND_ERROR" "$scriptName produced no result"; continue }
-    if ($global:CC_RESULT.ok -eq $true) { Write-WorkerOk $id $global:CC_RESULT.data }
+    if ($global:CC_RESULT.ok -eq $true) {
+      if ($null -eq $global:CC_RESULT.data) { $global:CC_RESULT.data = @{} }
+      if ($null -eq $global:CC_RESULT.data.timing) { $global:CC_RESULT.data.timing = @{} }
+      $global:CC_RESULT.data.timing.worker_exec_ms = $execMs
+      Write-WorkerOk $id $global:CC_RESULT.data
+    }
     else { Write-WorkerError $id ([string]$global:CC_RESULT.error.code) ([string]$global:CC_RESULT.error.message) }
   } catch {
     if ($id) { Write-WorkerError $id "BACKEND_ERROR" ([string]$_.Exception.Message) }

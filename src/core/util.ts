@@ -7,6 +7,15 @@ export function log(level: "debug" | "info" | "error", msg: string, extra?: unkn
   if (rank >= min) console.error(`[computer-control][${level}] ${msg}`, extra !== undefined ? JSON.stringify(extra) : "");
 }
 
+/** Performance instrumentation is opt-in (COMPUTER_CONTROL_TIMING=1 or debug log). */
+export function timingEnabled(): boolean {
+  return process.env.COMPUTER_CONTROL_TIMING === "1" || process.env.COMPUTER_CONTROL_LOG === "debug";
+}
+export function logTiming(event: string, fields: Record<string, unknown>): void {
+  if (!timingEnabled()) return;
+  console.error(`[computer-control][timing] ${JSON.stringify({ event, ...fields })}`);
+}
+
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 // Minimal promise-chain lock for MUTATIONS ONLY (input/focus). Reads and waits

@@ -99,11 +99,11 @@ export const windowFocus: ToolDef = {
     const receipt = beginMutation("window_focus");
     try {
       ctx.policy.assertInputEnabled();
-      // §8 sequence: resolve current window/process -> policy check -> focus -> verify -> fresh screen_id.
-      // An unauthorized window must never be intentionally focused to discover it was unauthorized.
-      const listing = await ctx.backend.windows();
-      const target = listing.windows.find(w => w.hwnd === a.hwnd);
-      if (!target) fail("WINDOW_NOT_FOUND", `no visible top-level window with hwnd ${a.hwnd}`);
+      // §8 sequence: query THIS hwnd -> policy check -> focus -> verify -> fresh screen_id.
+      // Single-window lookup (no full EnumWindows sweep). The lookup is fresh, so
+      // the policy check still sees the window's current pid/title; an unauthorized
+      // window is never focused to discover it was unauthorized.
+      const target = await ctx.backend.windowInfo(a.hwnd);
       ctx.policy.assertWindowAllowed({
         hwnd: target.hwnd, pid: target.pid, process: target.process,
         title: target.title, bounds: target.bounds,

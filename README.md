@@ -15,13 +15,13 @@ OMP/Muse (workspace ownership, loop/retry/recovery, independent verification)
 
 The MCP contains no provider logic, no dev-loop logic, no project-ownership tools.
 
-## Tool registry (13)
+## Tool registry (14)
 
 `observe`, `window_list`, `window_focus`, `find_text`, `find_element`,
-`click`, `type`, `key_press`, `scroll`, `drag`, `wait`, `wait_for_text`,
-`wait_for_change`. Schemas self-describe via `tools/list`. Perception ladder:
-`find_text`/`find_element` first, `observe` when visual reasoning is genuinely
-required, workspace/files/tests/git for project truth.
+`click`, `type`, `key_press`, `scroll`, `drag`, `read_text`, `wait`,
+`wait_for_text`, `wait_for_change`. Schemas self-describe via `tools/list`.
+Perception ladder: `find_text`/`find_element` first, `observe` when visual
+reasoning is genuinely required, workspace/files/tests/git for project truth.
 
 ## Observation model & screen_id
 
@@ -31,6 +31,16 @@ immediately before injection (foreground HWND + virtual-screen geometry +
 monitor-layout hash). `click`/`scroll`/`drag` accept `space: image|desktop|monitor`.
 `window_focus` resolves the target, checks the allowlist BEFORE focusing, focuses,
 verifies, then mints a fresh `screen_id`.
+
+### FullUiState vs MutationGateState
+
+`Get-UiState` (FullUiState) is what a binding needs: monitors, virtual screen,
+foreground (with process metadata), cursor, timestamp. The pre-injection gate
+uses `Get-MutationGateState` — foreground HWND + virtual screen + monitor hash
+only. It is deliberately minimal, is never used to mint a binding, and does not
+replace the injection-time PowerShell revalidation, which remains authoritative.
+`window_focus` uses a single-hwnd lookup (`window_info.ps1`), not a full
+enumeration.
 
 ### Window geometry convention
 
@@ -65,8 +75,22 @@ something was actually omitted/capped (a failed tile or the match cap); fully
 tiling an oversized region does **not** set it. Regex filtering is compiled with
 an explicit .NET match timeout (see below).
 
-## Bounded regex
+## Long content (`read_text`)
 
+`read_text` reads the foreground window's structured text via UI Automation
+(TextPattern first, ValuePattern fallback) with **no screenshot, no scrolling and
+no OCR**. Output is a bounded page (`offset`, `limit` default 4000, maximum fetch
+200000 chars); `truncated`/`total_known` are truthful. An optional `screen_id`
+pins the read to an observation's foreground window. Target identity is
+**HWND + owner PID**, verified before the read and re-checked after it: an
+`expected_hwnd`/`expected_pid` mismatch returns `FOREGROUND_CHANGED`, and an HWND
+that was destroyed or reused by another process during the read returns
+`STALE_SCREEN` with the text discarded (never another window's content reported
+as the bound target). The MCP returns content only; the worker decides what it
+means and how to page. This replaces observe→scroll→observe for reading terminal
+or document text.
+
+## Bounded regex
 Model-supplied regex is validated in TypeScript (length cap + syntax) before any
 evaluation, and the PowerShell matcher compiles patterns with a hard .NET
 `TimeSpan` match timeout. A pathological pattern cannot stall perception.
@@ -85,8 +109,41 @@ By default the backend runs a **persistent PowerShell worker pool**
 startup cost are paid once. `COMPUTER_CONTROL_PS_MODE=auto` (default) falls back
 to the spawn-per-call path if the worker cannot start; `worker` forces the pool;
 `spawn` forces per-call. Workers are health-checked, restarted on crash, and
-closed on shutdown. Mutations remain serialized by the mutation lock; reads may
-run concurrently across pool workers.
+closed on shutdown.
+
+### Lanes (concurrency)
+
+Two lanes isolate resource contention:
+
+- **control** (`windows.ps1`, `window_info.ps1`, `focus.ps1`, `state.ps1`,
+  `input.ps1`) — cheap window discovery/switching and mutations.
+- **perception** (`capture.ps1`, `perception.ps1`, `ocr.ps1`) — capture/UIA/OCR.
+
+A slow UIA traversal or OCR can therefore never starve a window switch or a
+mutation. Mutations remain serialized by the mutation lock; lanes only isolate
+resources. Sizes: `COMPUTER_CONTROL_PS_CONTROL_POOL` (default 1),
+`COMPUTER_CONTROL_PS_PERCEPTION_POOL` (default 2; legacy `COMPUTER_CONTROL_PS_POOL`).
+
+### Fast paths
+
+- Process names come from Win32 `QueryFullProcessImageName` (never the
+  `Get-Process` cmdlet, never the host PID).
+- `window_focus` resolves exactly **one** hwnd (`window_info.ps1`) instead of
+  enumerating every window and every process.
+- Shared helpers are loaded once per session (`_bootstrap.ps1`); the persistent
+  worker no longer re-parses them per request.
+- `COMPUTER_CONTROL_SETTLE_MS` (default 60) tunes the post-injection settle
+  before the post-state binding is read (fail-safe).
+
+## Performance instrumentation
+
+Set `COMPUTER_CONTROL_TIMING=1` (or `COMPUTER_CONTROL_LOG=debug`) to emit
+structured `[computer-control][timing]` lines on stderr: per-tool `total_ms`,
+per-script `queue_wait_ms`/`run_ms`/`lane`, and in-worker stage timings
+(`state_ms`, `uia_ms`, `capture_ms`, `encode_ms`, `thumb_ms`, `gate_ms`,
+`inject_ms`, `post_ms`, `focus_ms`, `win32_ms`, `enum_ms`, `worker_exec_ms`).
+Instrumentation is off by default.
+
 
 ## Startup capability probe
 
@@ -130,11 +187,12 @@ Works from Windows paths, UNC paths, and WSL-hosted paths via Windows Node.
 
 ## Known limitations
 
-Spawn-per-call PS latency (~200-500 ms/action) when the persistent worker is
-unavailable; no drag path scripting (basic validated primitive only); ValuePattern
+No window-metadata cache (single-hwnd lookup instead, to avoid cache-invalidation
+complexity); no drag path scripting (basic validated primitive only); ValuePattern
 matches report whole-control bounds; OS foreground lock can deny focus (verified,
 fails loudly); change detection is 8x8-thumbprint based (structural + brightness);
-single stdio client.
+single stdio client; OCR/UIA cost is dominated by the target app's accessibility
+tree, not the MCP.
 
 ## Test commands
 

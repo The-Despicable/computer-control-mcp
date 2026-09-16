@@ -1,4 +1,4 @@
-. "$PSScriptRoot\_io.ps1"; . "$PSScriptRoot\_win32.ps1"; . "$PSScriptRoot\_state.ps1"
+. "$PSScriptRoot\_bootstrap.ps1"
 function Get-Thumbprint($bmp) {
   $t = New-Object System.Drawing.Bitmap(8, 8)
   $g = [System.Drawing.Graphics]::FromImage($t)
@@ -15,7 +15,9 @@ function Get-Thumbprint($bmp) {
 try {
   [void][W]::SetProcessDPIAware()
   $req = Read-McpRequest
+  $tState = [System.Diagnostics.Stopwatch]::StartNew()
   $state = Get-UiState
+  $stateMs = $tState.ElapsedMilliseconds
   $vs = $state.virtual_screen
   $x = [int]$vs.x; $y = [int]$vs.y; $w = [int]$vs.w; $h = [int]$vs.h
   $t = $req.target
@@ -40,6 +42,7 @@ try {
       Fail "INVALID_ARGUMENT" "requested region is outside the virtual screen" # reject, never clamp
     }
   }
+  $tCap = [System.Diagnostics.Stopwatch]::StartNew()
   Add-Type -AssemblyName System.Drawing
   $bmp = New-Object System.Drawing.Bitmap($w, $h)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -56,7 +59,11 @@ try {
     $g2.DrawImage($bmp, 0, 0, $iw, $ih); $g2.Dispose(); $bmp.Dispose(); $bmp = $small
     $scale = $iw / [double]$w
   }
+  $capMs = $tCap.ElapsedMilliseconds
+  $tThumb = [System.Diagnostics.Stopwatch]::StartNew()
   $thumbB64 = Get-Thumbprint $bmp
+  $thumbMs = $tThumb.ElapsedMilliseconds
+  $tEnc = [System.Diagnostics.Stopwatch]::StartNew()
   $shotB64 = $null; $format = "png"
   if (-not $req.thumbprint_only) {
     if ($req.format) { $format = [string]$req.format }
@@ -71,9 +78,11 @@ try {
     $shotB64 = [Convert]::ToBase64String($ms.ToArray()); $ms.Dispose()
   }
   $bmp.Dispose()
+  $encMs = $tEnc.ElapsedMilliseconds
   Write-McpResult @{ ok = $true; data = @{
     screenshot_b64 = $shotB64; format = $format; width = $iw; height = $ih
     origin = @{ x = $x; y = $y }; scale = $scale; region = @{ x = $x; y = $y; w = $w; h = $h }
     thumbprint_b64 = $thumbB64; monitors = $state.monitors; virtual_screen = $state.virtual_screen
-    foreground = $state.foreground; cursor = $state.cursor; timestamp = $state.timestamp } }
+    foreground = $state.foreground; cursor = $state.cursor; timestamp = $state.timestamp
+    timing = @{ state_ms = $stateMs; capture_ms = $capMs; thumb_ms = $thumbMs; encode_ms = $encMs } } }
 } catch { if ($null -eq $global:CC_RESULT) { Fail "BACKEND_ERROR" $_.Exception.Message } else { throw } }

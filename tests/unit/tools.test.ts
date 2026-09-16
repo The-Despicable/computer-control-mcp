@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createCtx, bindPerceptionOutcome, type Backend, type Ctx, type CurrentUiState, type CaptureResult, type PerceiveOutcome, type WindowsResult } from "../../src/deps.js";
+import { createCtx, bindPerceptionOutcome, type Backend, type Ctx, type CurrentUiState, type CaptureResult, type PerceiveOutcome, type WindowsResult, type WindowEntry } from "../../src/deps.js";
 import { Policy } from "../../src/core/policy.js";
 import { ToolError, toToolError } from "../../src/core/errors.js";
 import { click, keyPress, type as typeTool } from "../../src/tools/input.js";
@@ -47,6 +47,14 @@ class FakeBackend implements Backend {
   async focus(hwnd: number): Promise<CurrentUiState> {
     this.focusCalls.push(hwnd);
     return this.live;
+  }
+  async windowInfo(hwnd: number): Promise<WindowEntry> {
+    const fg = this.live.foreground;
+    if (!fg || fg.hwnd !== hwnd) throw new ToolError("WINDOW_NOT_FOUND", `no visible top-level window with hwnd ${hwnd}`);
+    return { hwnd: fg.hwnd, pid: fg.pid, process: fg.process, title: fg.title, bounds: fg.bounds, is_foreground: true, is_minimized: false, z: 0 };
+  }
+  async readText(): Promise<{ text: string; complete: boolean; source: "text" | "value" | "none"; control_type: string | null; chars: number; identity: { hwnd: number; start_pid: number; end_pid: number; window_valid: boolean }; target: null }> {
+    return { text: "", complete: true, source: "none", control_type: null, chars: 0, identity: { hwnd: 0, start_pid: 0, end_pid: 0, window_valid: true }, target: null };
   }
   async perceive(): Promise<PerceiveOutcome> {
     return { ...this.live, mode: "text", matches: this.perceiveResp.matches, engines_used: ["uia"], ocr_available: false, truncated: false };

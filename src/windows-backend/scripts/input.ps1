@@ -1,4 +1,4 @@
-. "$PSScriptRoot\_io.ps1"; . "$PSScriptRoot\_win32.ps1"; . "$PSScriptRoot\_state.ps1"
+. "$PSScriptRoot\_bootstrap.ps1"
 function Test-OnMonitors([int]$x, [int]$y, $monitors) {
   foreach ($m in $monitors) {
     if ($x -ge $m.x -and $x -lt ($m.x + $m.w) -and $y -ge $m.y -and $y -lt ($m.y + $m.h)) { return $true }
@@ -8,37 +8,41 @@ function Test-OnMonitors([int]$x, [int]$y, $monitors) {
 try {
   [void][W]::SetProcessDPIAware()
   $req = Read-McpRequest
-  $state = Get-UiState
 
-  # ---- ATOMIC PRE-INJECTION VALIDATION (second lightweight check) ----
+  # MutationGateState only: foreground HWND + virtual screen + monitor hash.
+  # No process/cursor work on the gate path.
+  $tGate = [System.Diagnostics.Stopwatch]::StartNew()
+  $gate = Get-MutationGateState
+  $gateMs = $tGate.ElapsedMilliseconds
+
+  # ---- ATOMIC PRE-INJECTION VALIDATION (authoritative, immediately before SendInput) ----
   if ($req.expect) {
     $expectedHwnd = [long]$req.expect.foreground_hwnd
-    $currentHwnd = 0; if ($state.foreground) { $currentHwnd = [long]$state.foreground.hwnd }
-    if ($expectedHwnd -ne $currentHwnd) {
+    if ($expectedHwnd -ne [long]$gate.foreground_hwnd) {
       Fail "FOREGROUND_CHANGED" "foreground window changed since the observation; input NOT sent"
     }
     $ev = $req.expect.virtual_screen
     if ($ev) {
-      if ([int]$ev.x -ne [int]$state.virtual_screen.x -or [int]$ev.y -ne [int]$state.virtual_screen.y -or
-          [int]$ev.w -ne [int]$state.virtual_screen.w -or [int]$ev.h -ne [int]$state.virtual_screen.h) {
+      if ([int]$ev.x -ne [int]$gate.virtual_screen.x -or [int]$ev.y -ne [int]$gate.virtual_screen.y -or
+          [int]$ev.w -ne [int]$gate.virtual_screen.w -or [int]$ev.h -ne [int]$gate.virtual_screen.h) {
         Fail "STALE_SCREEN" "display geometry changed since the observation; input NOT sent"
       }
     }
     if ($req.expect.monitors_hash) {
-      $h = Get-MonitorsHash $state.monitors
-      if ($h -ne [string]$req.expect.monitors_hash) {
+      if ([string]$req.expect.monitors_hash -ne [string]$gate.monitors_hash) {
         Fail "STALE_SCREEN" "monitor layout changed since the observation; input NOT sent"
       }
     }
   }
 
+  $tInject = [System.Diagnostics.Stopwatch]::StartNew()
   $r = ""
   $transport = $null
   $clipRestored = $true
   switch ([string]$req.action) {
     "click" {
       $x = [int]$req.x; $y = [int]$req.y
-      if (-not (Test-OnMonitors $x $y $state.monitors)) {
+      if (-not (Test-OnMonitors $x $y $gate.monitors)) {
         Fail "INVALID_COORDINATE" "point ($x,$y) is not on any monitor; input NOT sent"
       }
       $count = 1; if ($req.count) { $count = [int]$req.count }
@@ -48,10 +52,10 @@ try {
     "drag" {
       $x1 = [int]$req.from.x; $y1 = [int]$req.from.y
       $x2 = [int]$req.to.x; $y2 = [int]$req.to.y
-      if (-not (Test-OnMonitors $x1 $y1 $state.monitors)) {
+      if (-not (Test-OnMonitors $x1 $y1 $gate.monitors)) {
         Fail "INVALID_COORDINATE" "drag source ($x1,$y1) is not on any monitor; input NOT sent"
       }
-      if (-not (Test-OnMonitors $x2 $y2 $state.monitors)) {
+      if (-not (Test-OnMonitors $x2 $y2 $gate.monitors)) {
         Fail "INVALID_COORDINATE" "drag destination ($x2,$y2) is not on any monitor; input NOT sent"
       }
       $button = "left"; if ($req.button) { $button = [string]$req.button }
@@ -62,16 +66,13 @@ try {
       $delta = 120 * [int]$req.amount
       if ($req.direction -eq "down") { $delta = -$delta }
       if ($null -ne $req.x -and $null -ne $req.y) {
-        if (-not (Test-OnMonitors ([int]$req.x) ([int]$req.y) $state.monitors)) {
+        if (-not (Test-OnMonitors ([int]$req.x) ([int]$req.y) $gate.monitors)) {
           Fail "INVALID_COORDINATE" "scroll point ($($req.x),$($req.y)) is not on any monitor; input NOT sent"
         }
         $r = [W]::ScrollAt([int]$req.x, [int]$req.y, $delta)
       } else { $r = [W]::ScrollAt($null, $null, $delta) }
     }
     "type" {
-      # Preferred transport: clipboard paste (atomic; avoids Win11 XAML RichEdit
-      # Unicode corruption). Fallback: direct Unicode SendInput when the
-      # clipboard is unavailable. The transport actually used is reported.
       Add-Type -AssemblyName System.Windows.Forms
       $transport = "clipboard"
       $oldClip = $null
@@ -101,7 +102,15 @@ try {
     default { Fail "INVALID_ARGUMENT" "unknown action '$($req.action)'" }
   }
   if ($r -ne "ok") { Fail "ACTION_FAILED" "input injection failed: $r (possible UIPI/integrity-level restriction on the target window)" }
-  Start-Sleep -Milliseconds 60
+  $injectMs = $tInject.ElapsedMilliseconds
+  # Settle delay before reading the post-state binding. Configurable; the read
+  # is fail-safe (a stale foreground just yields FOREGROUND_CHANGED next time).
+  $settle = 60; if ($env:COMPUTER_CONTROL_SETTLE_MS) { try { $settle = [int]$env:COMPUTER_CONTROL_SETTLE_MS } catch {} }
+  if ($settle -gt 0) { Start-Sleep -Milliseconds $settle }
+
+  $tPost = [System.Diagnostics.Stopwatch]::StartNew()
   $post = Get-UiState
-  Write-McpResult @{ ok = $true; data = @{ state = $post; clipboard_restored = $clipRestored; transport = $transport } }
+  $postMs = $tPost.ElapsedMilliseconds
+  Write-McpResult @{ ok = $true; data = @{ state = $post; clipboard_restored = $clipRestored; transport = $transport
+    timing = @{ gate_ms = $gateMs; inject_ms = $injectMs; post_ms = $postMs } } }
 } catch { if ($null -eq $global:CC_RESULT) { Fail "BACKEND_ERROR" $_.Exception.Message } else { throw } }
